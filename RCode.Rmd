@@ -1,0 +1,275 @@
+---
+title: 'Bayesian Hierarchical Poisson Model for Species Richness'
+author: 'Anshika Pradhan'
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(rjags)
+library(coda)
+library(ggplot2)
+library(dplyr)
+library(splines)
+```
+
+## 1. Data Preparation
+
+```{r}
+# Load the dataset
+species_data <- read.csv('ebird_raw_data.csv')
+
+# Remove rows with NA values in key variables
+species_data <- species_data %>%
+  filter(!is.na(howMany), !is.na(lat), !is.na(lng), !is.na(obsDt), !is.na(region))
+
+# Standardize effort variables
+species_data$duration <- as.vector(scale(species_data$howMany))
+species_data$effort <- as.vector(scale(species_data$lat))
+species_data$observers <- as.vector(scale(species_data$lng))
+
+# Convert date to day of year for seasonal effects
+species_data$day <- as.numeric(format(as.Date(species_data$obsDt), '%j'))
+
+# Encode region as a factor
+species_data$region <- as.factor(species_data$region)
+
+```
+
+```{r}
+species_data
+```
+
+
+
+## 2. Model Specification
+
+```{r}
+model_string <- "
+model {
+  pi <- 3.141592653589793
+
+  # Dispersion parameter for Negative Binomial
+  r ~ dgamma(0.01, 0.01) 
+
+  for (i in 1:N) {
+    # Convert lambda to probability p
+    p[i] <- r / (r + lambda[i])
+
+    # Negative Binomial distribution with r and p
+    Y[i] ~ dnegbin(p[i], r)
+
+    # Log-linear model for lambda
+    log(lambda[i]) <- alpha + b_state[region[i]] 
+                      + beta2 * effort[i] 
+                      + beta3 * observers[i] 
+                      + f_day[day[i]] 
+                      + log_duration[i]
+  }
+
+  # Random intercept for each region
+  for (j in 1:J) {
+    b_state_raw[j] ~ dnorm(0, 1)
+    b_state[j]     <- sigma_b * b_state_raw[j]
+  }
+
+  # Seasonal effect (Fourier series)
+  for (t in 1:365) {
+    f_day[t] <- gamma1 * sin(2 * pi * t / 365) + gamma2 * cos(2 * pi * t / 365)
+  }
+
+  # Hyperpriors for intercept + seasonals
+  mu_block      ~ dnorm(0, 0.1)
+  sigma_alpha   ~ dunif(0, 5)
+
+  mu_gamma      ~ dnorm(0, 0.1)
+  sigma_gamma   ~ dunif(0, 5)
+
+  # Non-centered raw parameters
+  alpha_raw     ~ dnorm(0, 1)
+  gamma1_raw    ~ dnorm(0, 1)
+  gamma2_raw    ~ dnorm(0, 1)
+
+  # Transform to actual intercept & seasonals
+  alpha   <- mu_block  + sigma_alpha * alpha_raw
+  gamma1  <- mu_gamma  + sigma_gamma * gamma1_raw
+  gamma2  <- mu_gamma  + sigma_gamma * gamma2_raw
+
+  # Priors for coefficients
+  beta1 ~ dnorm(0, 0.001)
+  beta2 ~ dnorm(0, 0.001)
+  beta3 ~ dnorm(0, 0.001)
+
+  sigma_b ~ dunif(0, 10)
+}"
+
+
+```
+
+## 3. Model Fitting
+```{r}
+# compute once in R
+species_data$log_duration <- log(ifelse(
+  species_data$duration <= 0,
+  1,                   # or 0.1
+  species_data$duration
+))
+
+```
+
+```{r}
+data_jags <- list(
+  Y = species_data$howMany,
+  log_duration = species_data$log_duration,
+  effort = species_data$effort,
+  observers = species_data$observers,
+  day = species_data$day,
+  region = as.numeric(species_data$region),
+  N = nrow(species_data),
+  J = length(unique(species_data$region))
+)
+
+```
+
+```{r}
+#data_jags
+```
+
+```{r}
+model <- jags.model(textConnection(model_string), data = data_jags, n.chains = 4, n.adapt = 5000)
+update(model, 20000)
+
+samples <- coda.samples(model, c("alpha", "beta1", "beta2", "beta3", "sigma_b", "gamma1", "gamma2"), n.iter = 100000)
+summary(samples)
+```
+
+
+
+
+## 4. Posterior Summaries and Visualization
+
+```{r}
+# Check convergence using Gelman-Rubin diagnostic
+gelman_results <- gelman.diag(samples, autoburnin = TRUE)
+
+# Print Gelman-Rubin diagnostic summary
+print(gelman_results)
+
+# Extract and print PSRF values
+psrf_values <- gelman_results$psrf
+print("Gelman-Rubin PSRF values:")
+print(psrf_values)
+
+# Check if PSRF values indicate convergence (close to 1)
+if (all(psrf_values < 1.4)) {
+  print("All PSRF values are below 1.4, indicating convergence.")
+} else {
+  print("Some PSRF values are greater than 1.4, indicating potential non-convergence.")
+}
+
+# Plot Gelman-Rubin diagnostic to visually inspect convergence
+gelman.plot(samples)
+
+# Trace plots for visual inspection
+traceplot(samples)
+
+```
+```{r}
+# Load necessary library
+library(coda)
+
+# Save high-resolution plots
+png("enhanced_gelman_rubin_plots.png", width=2000, height=1500, res=300)
+
+# Customize plot layout and appearance
+par(mfrow=c(3,3), mar=c(5, 5, 2, 2), cex.lab=1.5, cex.axis=1.3, lwd=2)
+
+# Plot Gelman-Rubin diagnostics with customized colors
+gelman.plot(
+  samples, 
+  auto.layout=FALSE, 
+  cex=1.2, 
+  lty=1, 
+  col=c("black", "red"), # Set colors for median and 97.5% CI
+)
+
+# Adding legend to distinguish median and 97.5% CI
+legend("topright", legend=c("Median", "97.5% CI"), col=c("black", "red"), lwd=2)
+
+# Close the file device
+dev.off()
+
+
+```
+```{r}
+# Extract posterior samples for the lambda parameter
+lambda_samples <- as.matrix(samples[[1]])
+
+# Calculate the posterior mean for lambda
+posterior_means <- apply(lambda_samples, 2, mean)
+
+
+```
+
+```{r}
+# Residuals between observed and fitted values
+residuals <- species_data$howMany - posterior_means
+
+# Ensure non-negative fitted values
+posterior_means[posterior_means <= 0] <- 1e-5
+
+# Degrees of freedom: number of observations - number of estimated parameters
+df_residual <- nrow(species_data) - length(posterior_means)
+
+# Bayesian dispersion statistic
+bayesian_dispersion <- sum((residuals^2) / posterior_means) / df_residual
+
+# Print Bayesian dispersion statistic
+print(paste("Bayesian Dispersion statistic:", round(bayesian_dispersion, 3)))
+
+```
+
+
+
+```{r}
+# Load necessary library
+library(coda)
+
+# Save high-resolution plots
+png("density_plots.png", width=2000, height=1500, res=300)
+
+# Customize plot layout and appearance
+par(mfrow=c(3,3), mar=c(5, 5, 2, 2), cex.lab=1.5, cex.axis=1.3, lwd=2)
+
+# Loop through each parameter and plot density
+for (param in colnames(as.matrix(samples))) {
+  # Extract the parameter samples
+  param_samples <- as.matrix(samples)[, param]
+  
+  # Plot density
+  plot(density(param_samples), 
+       main=paste("Density Plot -", param), 
+       xlab=param, 
+       ylab="Density", 
+       col="blue", 
+       lwd=2)
+  
+  # Add a vertical line at the mean
+  abline(v=mean(param_samples), col="red", lwd=2, lty=2)
+  
+  # Add a legend
+  legend("topright", legend=c("Density", "Mean"), col=c("blue", "red"), lwd=2, lty=c(1, 2))
+}
+
+# Close the file device
+dev.off()
+
+```
+
+
+
+
+
+
+
+
